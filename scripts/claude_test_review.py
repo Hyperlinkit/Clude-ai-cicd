@@ -93,7 +93,7 @@ def run_review(file_contents: dict) -> dict:
     print(f"Sending {len(file_contents)} file(s) to Claude...")
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         system=REVIEW_CRITERIA,
         messages=[{"role": "user", "content": build_prompt(file_contents)}]
