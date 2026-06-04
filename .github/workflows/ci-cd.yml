@@ -1,4 +1,4 @@
-name: CI/CD Pipeline with Claude AI Review
+name: CI/CD Pipeline with Gemini AI Review
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   # ─────────────────────────────────────────
-  # STEP 1: Run Tests
+  # STEP 1: Run Unit Tests
   # ─────────────────────────────────────────
   run-tests:
     name: Run Unit Tests
@@ -38,16 +38,18 @@ jobs:
           path: coverage.xml
 
   # ─────────────────────────────────────────
-  # STEP 2: Claude AI Code Review
+  # STEP 2: Gemini AI 3-Stage Review
   # ─────────────────────────────────────────
-  claude-ai-review:
-    name: Claude AI Code Review
+  gemini-ai-review:
+    name: "Gemini AI Review (Quality + Tests + Structure)"
     runs-on: ubuntu-latest
     needs: run-tests
 
     outputs:
       review_passed: ${{ steps.parse-result.outputs.review_passed }}
       review_summary: ${{ steps.parse-result.outputs.review_summary }}
+      stages_passed: ${{ steps.parse-result.outputs.stages_passed }}
+      test_pass_rate: ${{ steps.parse-result.outputs.test_pass_rate }}
 
     steps:
       - name: Checkout code
@@ -60,9 +62,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Claude SDK
-        run: pip install anthropic
-
       - name: Get changed files
         run: |
           if [ "${{ github.event_name }}" == "pull_request" ]; then
@@ -73,10 +72,10 @@ jobs:
           echo "Changed files:"
           cat changed_files.txt
 
-      - name: Run Claude AI Review
-        id: claude-review
+      - name: Run Gemini AI 3-Stage Review
+        id: gemini-review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python scripts/claude_test_review.py \
             --changed-files changed_files.txt \
@@ -84,27 +83,59 @@ jobs:
 
       - name: Parse review result
         id: parse-result
+        if: always()
         run: |
-          PASSED=$(python -c "import json; d=json.load(open('review_result.json')); print(d['passed'])")
-          SUMMARY=$(python -c "import json; d=json.load(open('review_result.json')); print(d['summary'])")
+          PASSED=$(python -c "import json; d=json.load(open('review_result.json')); print(d['overall_passed'])")
+          SUMMARY=$(python -c "import json; d=json.load(open('review_result.json')); print(d['overall_summary'])")
+          STAGES=$(python -c "import json; d=json.load(open('review_result.json')); print(str(d['stages_passed'])+'/'+str(d['stages_total']))")
+          RATE=$(python -c "import json; d=json.load(open('review_result.json')); print(d['test_summary']['pass_rate'])")
           echo "review_passed=$PASSED" >> $GITHUB_OUTPUT
           echo "review_summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "stages_passed=$STAGES" >> $GITHUB_OUTPUT
+          echo "test_pass_rate=$RATE" >> $GITHUB_OUTPUT
 
-      - name: Upload Claude Review Report
+      - name: Upload Review Report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: claude-review-report
+          name: gemini-review-report
           path: review_result.json
 
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
+      - name: Comment on PR with full report
+        if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const review = JSON.parse(fs.readFileSync('review_result.json', 'utf8'));
-            const emoji = review.passed ? '✅' : '❌';
-            const body = `## ${emoji} Claude AI Code Review\n\n**Status:** ${review.passed ? 'PASSED' : 'FAILED'}\n\n**Summary:** ${review.summary}\n\n**Details:**\n${review.details}`;
+            const r = JSON.parse(fs.readFileSync('review_result.json', 'utf8'));
+            const emoji = r.overall_passed ? '✅' : '❌';
+            const status = r.overall_passed ? 'APPROVED' : 'REJECTED';
+
+            // Build test cases table
+            let testTable = '';
+            if (r.test_cases && r.test_cases.length > 0) {
+              testTable = '\n\n### 🧪 Test Cases\n| Test | Status | Reason |\n|---|---|---|\n';
+              for (const t of r.test_cases) {
+                const icon = t.status === 'PASS' ? '✅' : '❌';
+                testTable += `| ${t.test_name} | ${icon} ${t.status} | ${t.reason} |\n`;
+              }
+            }
+
+            // Build stage summary
+            let stageSummary = '\n\n### 📋 Stage Results\n';
+            for (const s of r.stage_results || []) {
+              const sIcon = s.passed ? '✅' : '❌';
+              stageSummary += `- ${sIcon} **Stage ${s.stage}: ${s.stage_name}** — ${s.summary}\n`;
+            }
+
+            const ts = r.test_summary;
+            const body = `## ${emoji} Gemini AI Code Review — ${status}
+
+**Summary:** ${r.overall_summary}
+**Stages:** ${r.stages_passed}/${r.stages_total} passed
+**Tests:** ${ts.passed}/${ts.total} passed (${ts.pass_rate})
+${stageSummary}${testTable}`;
+
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -112,22 +143,24 @@ jobs:
               body: body
             });
 
-      - name: Block deployment if review failed
+      - name: Block pipeline if review failed
         if: steps.parse-result.outputs.review_passed == 'False'
         run: |
-          echo "❌ Claude AI Review FAILED. Deployment blocked."
+          echo "❌ Gemini AI Review FAILED. Deployment blocked."
+          echo "Stages passed: ${{ steps.parse-result.outputs.stages_passed }}"
+          echo "Reason: ${{ steps.parse-result.outputs.review_summary }}"
           exit 1
 
   # ─────────────────────────────────────────
-  # STEP 3: Deploy (only if both pass)
+  # STEP 3: Deploy (only if all stages pass)
   # ─────────────────────────────────────────
   deploy:
     name: Deploy to Server
     runs-on: ubuntu-latest
-    needs: [run-tests, claude-ai-review]
+    needs: [run-tests, gemini-ai-review]
     if: |
       github.ref == 'refs/heads/main' &&
-      needs.claude-ai-review.outputs.review_passed == 'True'
+      needs.gemini-ai-review.outputs.review_passed == 'True'
 
     steps:
       - name: Checkout code
@@ -147,7 +180,10 @@ jobs:
             sudo systemctl restart your-app
 
       - name: Deployment success
-        run: echo "✅ Deployed successfully to ${{ secrets.SERVER_HOST }}"
+        run: |
+          echo "✅ Deployed successfully!"
+          echo "Stages passed : ${{ needs.gemini-ai-review.outputs.stages_passed }}"
+          echo "Test pass rate: ${{ needs.gemini-ai-review.outputs.test_pass_rate }}"
 
   # ─────────────────────────────────────────
   # Rejection Notification
@@ -155,10 +191,22 @@ jobs:
   notify-rejection:
     name: Notify Rejection
     runs-on: ubuntu-latest
-    needs: claude-ai-review
+    needs: gemini-ai-review
     if: failure()
     steps:
-      - name: Log rejection
+      - name: Download review report
+        uses: actions/download-artifact@v4
+        with:
+          name: gemini-review-report
+
+      - name: Print rejection report
         run: |
-          echo "🚫 Deployment REJECTED by Claude AI"
-          echo "Reason: ${{ needs.claude-ai-review.outputs.review_summary }}"
+          echo "🚫 ============================================"
+          echo "🚫  DEPLOYMENT REJECTED BY GEMINI AI REVIEW"
+          echo "🚫 ============================================"
+          echo ""
+          echo "Stages passed : ${{ needs.gemini-ai-review.outputs.stages_passed }}"
+          echo "Reason        : ${{ needs.gemini-ai-review.outputs.review_summary }}"
+          echo ""
+          echo "Full report:"
+          cat review_result.json
